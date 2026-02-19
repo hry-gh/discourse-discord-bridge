@@ -336,7 +336,7 @@ async fn send_to_discourse(
 
     state
         .http_client
-        .put(&webhook_url)
+        .post(&webhook_url)
         .form(&DiscourseMessageForm { text: message })
         .send()
         .await?
