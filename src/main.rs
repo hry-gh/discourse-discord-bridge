@@ -27,7 +27,8 @@ struct Config {
     discourse_api_username: String,
     discourse_api_key: String,
     listen_address: Option<String>,
-    channel_mappings: HashMap<u64, u64>,
+    #[serde(default)]
+    channel_mappings: HashMap<String, u64>,
 }
 
 impl Config {
@@ -43,10 +44,17 @@ impl Config {
             .unwrap_or_else(|e| panic!("Failed to parse {}: {}", config_path, e))
     }
 
+    fn channel_mappings_parsed(&self) -> HashMap<u64, u64> {
+        self.channel_mappings
+            .iter()
+            .filter_map(|(k, &v)| k.parse::<u64>().ok().map(|k| (k, v)))
+            .collect()
+    }
+
     fn reverse_channel_mappings(&self) -> HashMap<u64, u64> {
         self.channel_mappings
             .iter()
-            .map(|(&k, &v)| (v, k))
+            .filter_map(|(k, &v)| k.parse::<u64>().ok().map(|k| (v, k)))
             .collect()
     }
 }
@@ -58,12 +66,14 @@ struct AppState {
     config: Arc<Config>,
     http_client: reqwest::Client,
     discord_http: Arc<Http>,
+    // Discourse channel ID -> Discord channel ID
+    channel_mappings: Arc<HashMap<u64, u64>>,
+    // Discord channel ID -> Discourse channel ID
+    reverse_mappings: Arc<HashMap<u64, u64>>,
     // Discord channel -> Discord webhook
     discord_webhooks: Arc<RwLock<HashMap<u64, Webhook>>>,
     // (username, discourse_channel_id) -> Discourse webhook URL
     discourse_webhooks: Arc<RwLock<HashMap<DiscourseWebhookKey, String>>>,
-    // Discord channel ID -> Discourse channel ID
-    reverse_mappings: Arc<HashMap<u64, u64>>,
 }
 
 // Discourse -> Discord types
@@ -379,7 +389,7 @@ async fn handle_discourse_webhook(
         msg.message
     );
 
-    let discord_channel_id = match state.config.channel_mappings.get(&channel.id) {
+    let discord_channel_id = match state.channel_mappings.get(&channel.id) {
         Some(&id) => id,
         None => {
             tracing::debug!(
@@ -450,6 +460,7 @@ async fn main() {
         .clone()
         .unwrap_or_else(|| "0.0.0.0:3000".to_string());
 
+    let channel_mappings = config.channel_mappings_parsed();
     let reverse_mappings = config.reverse_channel_mappings();
     let discord_http = Arc::new(Http::new(&config.discord_bot_token));
 
@@ -457,9 +468,10 @@ async fn main() {
         config: Arc::new(config),
         http_client: reqwest::Client::new(),
         discord_http: discord_http.clone(),
+        channel_mappings: Arc::new(channel_mappings),
+        reverse_mappings: Arc::new(reverse_mappings),
         discord_webhooks: Arc::new(RwLock::new(HashMap::new())),
         discourse_webhooks: Arc::new(RwLock::new(HashMap::new())),
-        reverse_mappings: Arc::new(reverse_mappings),
     };
 
     let handler = DiscordHandler {

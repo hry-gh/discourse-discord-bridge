@@ -1,10 +1,16 @@
 FROM rust:1.93 AS builder
 
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
 
+# Cache dependencies
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo "fn main() {}" > src/main.rs
 RUN cargo build --release
+RUN rm -rf src
+
+# Build actual application
+COPY src ./src
+RUN touch src/main.rs && cargo build --release
 
 FROM debian:bookworm-slim
 
