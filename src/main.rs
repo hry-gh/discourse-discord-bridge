@@ -490,7 +490,7 @@ impl EventHandler for DiscordHandler {
             msg.content
         );
 
-        let content = if let Some(ref reply) = msg.referenced_message {
+        let mut content = if let Some(ref reply) = msg.referenced_message {
             format!(
                 "> **@{}:** {}\n\n{}",
                 reply.author.name, reply.content, msg.content
@@ -498,6 +498,19 @@ impl EventHandler for DiscordHandler {
         } else {
             msg.content.clone()
         };
+
+        // Append attachment URLs
+        for attachment in &msg.attachments {
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(&attachment.url);
+        }
+
+        // Skip empty messages
+        if content.is_empty() {
+            return;
+        }
 
         if let Err(e) = send_to_discourse(
             &self.state,
