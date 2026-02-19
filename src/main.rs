@@ -93,6 +93,18 @@ struct DiscourseMessage {
     message: String,
     user: DiscourseUser,
     chat_webhook_event: Option<serde_json::Value>,
+    in_reply_to: Option<DiscourseReplyInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscourseReplyInfo {
+    excerpt: String,
+    user: DiscourseReplyUser,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscourseReplyUser {
+    username: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,12 +216,24 @@ async fn send_to_discord(
     discord_channel_id: u64,
     user: &DiscourseUser,
     message: &str,
+    reply_to: Option<&DiscourseReplyInfo>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let webhook = get_or_create_discord_webhook(state, discord_channel_id)
         .await
         .ok_or("Failed to get or create Discord webhook")?;
 
-    let sanitized = sanitize_discord_message(message);
+    let content = if let Some(reply) = reply_to {
+        format!(
+            "> **@{}:** {}\n{}",
+            reply.user.username,
+            reply.excerpt,
+            message
+        )
+    } else {
+        message.to_string()
+    };
+
+    let sanitized = sanitize_discord_message(&content);
 
     let builder = ExecuteWebhook::new()
         .content(&sanitized)
@@ -423,7 +447,7 @@ async fn handle_discourse_webhook(
         }
     };
 
-    if let Err(e) = send_to_discord(&state, discord_channel_id, &msg.user, &msg.message).await {
+    if let Err(e) = send_to_discord(&state, discord_channel_id, &msg.user, &msg.message, msg.in_reply_to.as_ref()).await {
         tracing::error!("Failed to send to Discord: {}", e);
         return StatusCode::INTERNAL_SERVER_ERROR;
     }
@@ -460,11 +484,22 @@ impl EventHandler for DiscordHandler {
             msg.content
         );
 
+        let content = if let Some(ref reply) = msg.referenced_message {
+            format!(
+                "> **@{}:** {}\n{}",
+                reply.author.name,
+                reply.content,
+                msg.content
+            )
+        } else {
+            msg.content.clone()
+        };
+
         if let Err(e) = send_to_discourse(
             &self.state,
             discourse_channel_id,
             &msg.author.name,
-            &msg.content,
+            &content,
         )
         .await
         {
