@@ -1,0 +1,13 @@
+discord_bot_token = "your-discord-bot-token"
+discourse_webhook_secret = "your-discourse-webhook-secret"
+discourse_base_url = "https://forum.example.com"
+discourse_api_username = "system"
+discourse_api_key = "your-discourse-api-key"
+
+# Optional, defaults to 0.0.0.0:3000
+listen_address = "0.0.0.0:3000"
+
+# Discourse channel ID -> Discord channel ID
+# Messages flow both directions using this mapping
+[channel_mappings]
+2 = 1234567890123456789
