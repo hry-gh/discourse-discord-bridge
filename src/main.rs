@@ -191,6 +191,14 @@ async fn get_or_create_discord_webhook(
     Some(webhook)
 }
 
+fn sanitize_discord_message(message: &str) -> String {
+    message
+        .replace("@everyone", "@\u{200B}everyone")
+        .replace("@here", "@\u{200B}here")
+        // Role mentions: <@&ROLE_ID>
+        .replace("<@&", "<@\u{200B}&")
+}
+
 async fn send_to_discord(
     state: &AppState,
     discord_channel_id: u64,
@@ -201,8 +209,10 @@ async fn send_to_discord(
         .await
         .ok_or("Failed to get or create Discord webhook")?;
 
+    let sanitized = sanitize_discord_message(message);
+
     let builder = ExecuteWebhook::new()
-        .content(message)
+        .content(&sanitized)
         .username(&user.username)
         .avatar_url(build_avatar_url(
             &state.config.discourse_base_url,
