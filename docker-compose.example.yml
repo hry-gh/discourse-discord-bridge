@@ -1,0 +1,8 @@
+services:
+  discourse-discord-bridge:
+    build: https://github.com/hry-gh/discourse-discord-bridge.git
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./config.toml:/config/config.toml:ro
