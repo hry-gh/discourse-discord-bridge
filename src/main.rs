@@ -344,13 +344,26 @@ async fn send_to_discourse(
         text: &'a str,
     }
 
-    state
+    let response = state
         .http_client
         .post(&webhook_url)
         .form(&DiscourseMessageForm { text: message })
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        tracing::error!(
+            "Discourse webhook failed: status={}, url={}, username={}, message={:?}, response={}",
+            status,
+            webhook_url,
+            username,
+            message,
+            body
+        );
+        return Err(format!("Discourse webhook failed: {} - {}", status, body).into());
+    }
 
     Ok(())
 }
