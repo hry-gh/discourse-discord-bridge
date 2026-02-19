@@ -225,9 +225,7 @@ async fn send_to_discord(
     let content = if let Some(reply) = reply_to {
         format!(
             "> **@{}:** {}\n{}",
-            reply.user.username,
-            reply.excerpt,
-            message
+            reply.user.username, reply.excerpt, message
         )
     } else {
         message.to_string()
@@ -447,7 +445,15 @@ async fn handle_discourse_webhook(
         }
     };
 
-    if let Err(e) = send_to_discord(&state, discord_channel_id, &msg.user, &msg.message, msg.in_reply_to.as_ref()).await {
+    if let Err(e) = send_to_discord(
+        &state,
+        discord_channel_id,
+        &msg.user,
+        &msg.message,
+        msg.in_reply_to.as_ref(),
+    )
+    .await
+    {
         tracing::error!("Failed to send to Discord: {}", e);
         return StatusCode::INTERNAL_SERVER_ERROR;
     }
@@ -486,10 +492,8 @@ impl EventHandler for DiscordHandler {
 
         let content = if let Some(ref reply) = msg.referenced_message {
             format!(
-                "> **@{}:** {}\n{}",
-                reply.author.name,
-                reply.content,
-                msg.content
+                "> **@{}:** {}\n\n{}",
+                reply.author.name, reply.content, msg.content
             )
         } else {
             msg.content.clone()
