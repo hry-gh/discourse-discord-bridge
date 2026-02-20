@@ -11,8 +11,8 @@ use axum::{
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serenity::all::{
-    ChannelId, Client, Context, CreateWebhook, EventHandler, ExecuteWebhook, GatewayIntents, Http,
-    Message as DiscordMessage, Ready, Webhook,
+    ChannelId, Client, Context, CreateWebhook, EditWebhookMessage, EventHandler, ExecuteWebhook,
+    GatewayIntents, Http, Message as DiscordMessage, MessageId, Ready, Webhook,
 };
 use sha2::Sha256;
 use tokio::sync::RwLock;
@@ -74,6 +74,8 @@ struct AppState {
     discord_webhooks: Arc<RwLock<HashMap<u64, Webhook>>>,
     // (username, discourse_channel_id) -> Discourse webhook URL
     discourse_webhooks: Arc<RwLock<HashMap<DiscourseWebhookKey, String>>>,
+    // Discourse message ID -> Discord message ID
+    message_map: Arc<RwLock<HashMap<u64, u64>>>,
 }
 
 // Discourse -> Discord types
@@ -90,10 +92,18 @@ struct DiscourseChatMessage {
 
 #[derive(Debug, Deserialize)]
 struct DiscourseMessage {
+    id: u64,
     message: String,
     user: DiscourseUser,
     chat_webhook_event: Option<serde_json::Value>,
     in_reply_to: Option<DiscourseReplyInfo>,
+    #[serde(default)]
+    uploads: Vec<DiscourseUpload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscourseUpload {
+    url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,15 +224,17 @@ fn sanitize_discord_message(message: &str) -> String {
 async fn send_to_discord(
     state: &AppState,
     discord_channel_id: u64,
+    discourse_message_id: u64,
     user: &DiscourseUser,
     message: &str,
     reply_to: Option<&DiscourseReplyInfo>,
+    uploads: &[DiscourseUpload],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let webhook = get_or_create_discord_webhook(state, discord_channel_id)
         .await
         .ok_or("Failed to get or create Discord webhook")?;
 
-    let content = if let Some(reply) = reply_to {
+    let mut content = if let Some(reply) = reply_to {
         format!(
             "> **@{}:** {}\n{}",
             reply.user.username, reply.excerpt, message
@@ -230,6 +242,19 @@ async fn send_to_discord(
     } else {
         message.to_string()
     };
+
+    for upload in uploads {
+        if !content.is_empty() {
+            content.push('\n');
+        }
+
+        if upload.url.starts_with("http://") || upload.url.starts_with("https://") {
+            content.push_str(&upload.url);
+        } else {
+            content.push_str(&state.config.discourse_base_url);
+            content.push_str(&upload.url);
+        }
+    }
 
     let sanitized = sanitize_discord_message(&content);
 
@@ -241,7 +266,15 @@ async fn send_to_discord(
             &user.avatar_template,
         ));
 
-    webhook.execute(&state.discord_http, false, builder).await?;
+    if let Some(discord_message) = webhook.execute(&state.discord_http, true, builder).await? {
+        let mut message_map = state.message_map.write().await;
+        message_map.insert(discourse_message_id, discord_message.id.get());
+        tracing::debug!(
+            "Mapped Discourse message {} -> Discord message {}",
+            discourse_message_id,
+            discord_message.id
+        );
+    }
 
     Ok(())
 }
@@ -408,6 +441,11 @@ async fn handle_discourse_webhook(
         return StatusCode::UNAUTHORIZED;
     }
 
+    let event_type = headers
+        .get("x-discourse-event")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("chat_message_created");
+
     let payload: DiscourseWebhookPayload = match serde_json::from_slice(&body) {
         Ok(p) => p,
         Err(e) => {
@@ -427,13 +465,6 @@ async fn handle_discourse_webhook(
         return StatusCode::OK;
     }
 
-    tracing::info!(
-        "[Discourse #{}] {}: {}",
-        channel.title,
-        msg.user.username,
-        msg.message
-    );
-
     let discord_channel_id = match state.channel_mappings.get(&channel.id) {
         Some(&id) => id,
         None => {
@@ -445,20 +476,158 @@ async fn handle_discourse_webhook(
         }
     };
 
-    if let Err(e) = send_to_discord(
-        &state,
-        discord_channel_id,
-        &msg.user,
-        &msg.message,
-        msg.in_reply_to.as_ref(),
-    )
-    .await
-    {
-        tracing::error!("Failed to send to Discord: {}", e);
-        return StatusCode::INTERNAL_SERVER_ERROR;
+    match event_type {
+        "chat_message_created" => {
+            tracing::info!(
+                "[Discourse #{}] {}: {}",
+                channel.title,
+                msg.user.username,
+                msg.message
+            );
+
+            if let Err(e) = send_to_discord(
+                &state,
+                discord_channel_id,
+                msg.id,
+                &msg.user,
+                &msg.message,
+                msg.in_reply_to.as_ref(),
+                &msg.uploads,
+            )
+            .await
+            {
+                tracing::error!("Failed to send to Discord: {}", e);
+                return StatusCode::INTERNAL_SERVER_ERROR;
+            }
+        }
+        "chat_message_edited" => {
+            tracing::info!(
+                "[Discourse #{}] {} edited: {}",
+                channel.title,
+                msg.user.username,
+                msg.message
+            );
+
+            if let Err(e) = edit_discord_message(
+                &state,
+                discord_channel_id,
+                msg.id,
+                &msg.message,
+                &msg.uploads,
+            )
+            .await
+            {
+                tracing::error!("Failed to edit Discord message: {}", e);
+                return StatusCode::INTERNAL_SERVER_ERROR;
+            }
+        }
+        "chat_message_trashed" => {
+            tracing::info!(
+                "[Discourse #{}] {} deleted message {}",
+                channel.title,
+                msg.user.username,
+                msg.id
+            );
+
+            if let Err(e) = delete_discord_message(&state, discord_channel_id, msg.id).await {
+                tracing::error!("Failed to delete Discord message: {}", e);
+                return StatusCode::INTERNAL_SERVER_ERROR;
+            }
+        }
+        _ => {
+            tracing::debug!("Ignoring unknown event type: {}", event_type);
+        }
     }
 
     StatusCode::OK
+}
+
+async fn edit_discord_message(
+    state: &AppState,
+    discord_channel_id: u64,
+    discourse_message_id: u64,
+    message: &str,
+    uploads: &[DiscourseUpload],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let discord_message_id = {
+        let message_map = state.message_map.read().await;
+        match message_map.get(&discourse_message_id) {
+            Some(&id) => id,
+            None => {
+                tracing::debug!(
+                    "No Discord message ID found for Discourse message {}",
+                    discourse_message_id
+                );
+                return Ok(());
+            }
+        }
+    };
+
+    let webhook = get_or_create_discord_webhook(state, discord_channel_id)
+        .await
+        .ok_or("Failed to get Discord webhook")?;
+
+    let mut content = message.to_string();
+
+    for upload in uploads {
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        if upload.url.starts_with("http://") || upload.url.starts_with("https://") {
+            content.push_str(&upload.url);
+        } else {
+            content.push_str(&state.config.discourse_base_url);
+            content.push_str(&upload.url);
+        }
+    }
+
+    let sanitized = sanitize_discord_message(&content);
+
+    let builder = EditWebhookMessage::new().content(&sanitized);
+
+    webhook
+        .edit_message(
+            &state.discord_http,
+            MessageId::new(discord_message_id),
+            builder,
+        )
+        .await?;
+
+    Ok(())
+}
+
+async fn delete_discord_message(
+    state: &AppState,
+    discord_channel_id: u64,
+    discourse_message_id: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let discord_message_id = {
+        let mut message_map = state.message_map.write().await;
+        match message_map.remove(&discourse_message_id) {
+            Some(id) => id,
+            None => {
+                tracing::debug!(
+                    "No Discord message ID found for Discourse message {}",
+                    discourse_message_id
+                );
+                return Ok(());
+            }
+        }
+    };
+
+    let webhook = get_or_create_discord_webhook(state, discord_channel_id)
+        .await
+        .ok_or("Failed to get Discord webhook")?;
+
+    webhook
+        .delete_message(
+            &state.discord_http,
+            None,
+            MessageId::new(discord_message_id),
+        )
+        .await?;
+
+    Ok(())
 }
 
 struct DiscordHandler {
@@ -547,6 +716,7 @@ async fn main() {
         reverse_mappings: Arc::new(reverse_mappings),
         discord_webhooks: Arc::new(RwLock::new(HashMap::new())),
         discourse_webhooks: Arc::new(RwLock::new(HashMap::new())),
+        message_map: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let handler = DiscordHandler {
