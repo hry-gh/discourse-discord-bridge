@@ -16,3 +16,4 @@ hex = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
 serenity = { version = "0.12", features = ["client", "gateway", "model", "cache"] }
 toml = "0.8"
+sha1 = "0.10"

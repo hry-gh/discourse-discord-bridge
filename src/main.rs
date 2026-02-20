@@ -14,6 +14,7 @@ use serenity::all::{
     ChannelId, Client, Context, CreateWebhook, EditWebhookMessage, EventHandler, ExecuteWebhook,
     GatewayIntents, Http, Message as DiscordMessage, MessageId, Ready, Webhook,
 };
+use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use tokio::sync::RwLock;
 
@@ -76,6 +77,8 @@ struct AppState {
     discourse_webhooks: Arc<RwLock<HashMap<DiscourseWebhookKey, String>>>,
     // Discourse message ID -> Discord message ID
     message_map: Arc<RwLock<HashMap<u64, u64>>>,
+    // Discord user ID -> Discourse emoji name (already uploaded)
+    user_emojis: Arc<RwLock<HashMap<u64, String>>>,
 }
 
 // Discourse -> Discord types
@@ -282,9 +285,11 @@ async fn send_to_discord(
 async fn get_or_create_discourse_webhook(
     state: &AppState,
     username: &str,
+    emoji_name: &str,
     discourse_channel_id: u64,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let key = (username.to_string(), discourse_channel_id);
+    let webhook_name = format!("{}-{}-{}", username, emoji_name, discourse_channel_id);
+    let key = (webhook_name.clone(), discourse_channel_id);
 
     {
         let webhooks = state.discourse_webhooks.read().await;
@@ -309,13 +314,8 @@ async fn get_or_create_discourse_webhook(
         .json()
         .await?;
 
-    let webhook_name = format!("{}-{}", username, discourse_channel_id);
-
     for webhook in response.incoming_chat_webhooks {
-        if webhook.name == webhook_name
-            && webhook.chat_channel.id == discourse_channel_id
-            && webhook.username.as_deref() == Some(username)
-        {
+        if webhook.name == webhook_name && webhook.chat_channel.id == discourse_channel_id {
             let mut webhooks = state.discourse_webhooks.write().await;
             webhooks.insert(key, webhook.url.clone());
             return Ok(webhook.url);
@@ -374,7 +374,7 @@ async fn get_or_create_discourse_webhook(
             username,
             chat_channel_id: discourse_channel_id,
             description: "",
-            emoji: "",
+            emoji: emoji_name,
         })
         .send()
         .await?
@@ -389,10 +389,11 @@ async fn send_to_discourse(
     state: &AppState,
     discourse_channel_id: u64,
     username: &str,
+    emoji_name: &str,
     message: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let webhook_url =
-        get_or_create_discourse_webhook(state, username, discourse_channel_id).await?;
+        get_or_create_discourse_webhook(state, username, emoji_name, discourse_channel_id).await?;
 
     #[derive(Serialize)]
     struct DiscourseMessageForm<'a> {
@@ -421,6 +422,134 @@ async fn send_to_discourse(
     }
 
     Ok(())
+}
+
+async fn ensure_user_emoji(
+    state: &AppState,
+    user_id: u64,
+    avatar_url: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    {
+        let emojis = state.user_emojis.read().await;
+        if let Some(emoji_name) = emojis.get(&user_id) {
+            return Ok(emoji_name.clone());
+        }
+    }
+
+    let emoji_name = avatar_url
+        .split('/')
+        .next_back()
+        .and_then(|s| s.split('?').next())
+        .and_then(|s| {
+            s.strip_suffix(".webp")
+                .or_else(|| s.strip_suffix(".png"))
+                .or_else(|| s.strip_suffix(".gif"))
+        })
+        .unwrap_or("avatar")
+        .to_string();
+
+    let avatar_bytes = state
+        .http_client
+        .get(avatar_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+
+    let mut hasher = Sha1::new();
+    hasher.update(&avatar_bytes);
+    let sha1_checksum = hex::encode(hasher.finalize());
+
+    let content_type = if avatar_url.contains(".webp") {
+        "image/webp"
+    } else if avatar_url.contains(".gif") {
+        "image/gif"
+    } else {
+        "image/png"
+    };
+
+    let upload_url = format!(
+        "{}/admin/config/emoji.json",
+        state.config.discourse_base_url
+    );
+
+    let form = reqwest::multipart::Form::new()
+        .text("upload_type", "emoji")
+        .text("name", emoji_name.clone())
+        .text("type", content_type.to_string())
+        .text("group", "user")
+        .text("sha1_checksum", sha1_checksum)
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(avatar_bytes.to_vec())
+                .file_name(format!("{}.webp", emoji_name))
+                .mime_str(content_type)?,
+        );
+
+    let response = state
+        .http_client
+        .post(&upload_url)
+        .header("Api-Username", &state.config.discourse_api_username)
+        .header("Api-Key", &state.config.discourse_api_key)
+        .multipart(form)
+        .send()
+        .await?;
+
+    let emoji_created = if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+
+        if body.contains("already been taken") || body.contains("already exists") {
+            tracing::debug!("Emoji {} already exists", emoji_name);
+            false
+        } else {
+            tracing::warn!(
+                "Failed to upload emoji {}: {} - {}",
+                emoji_name,
+                status,
+                body
+            );
+            false
+        }
+    } else {
+        tracing::info!("Uploaded emoji {} for user {}", emoji_name, user_id);
+        true
+    };
+
+    if emoji_created {
+        let deny_list_url = format!(
+            "{}/admin/site_settings/emoji_deny_list",
+            state.config.discourse_base_url
+        );
+
+        let response = state
+            .http_client
+            .put(&deny_list_url)
+            .header("Api-Username", &state.config.discourse_api_username)
+            .header("Api-Key", &state.config.discourse_api_key)
+            .form(&[("emoji_deny_list", &emoji_name)])
+            .send()
+            .await;
+
+        match response {
+            Ok(r) if r.status().is_success() => {
+                tracing::debug!("Added emoji {} to deny list", emoji_name);
+            }
+            Ok(r) => {
+                let body = r.text().await.unwrap_or_default();
+                tracing::warn!("Failed to add emoji {} to deny list: {}", emoji_name, body);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to add emoji {} to deny list: {}", emoji_name, e);
+            }
+        }
+    }
+
+    let mut emojis = state.user_emojis.write().await;
+    emojis.insert(user_id, emoji_name.clone());
+
+    Ok(emoji_name)
 }
 
 async fn handle_discourse_webhook(
@@ -681,10 +810,24 @@ impl EventHandler for DiscordHandler {
             return;
         }
 
+        // Upload user's avatar as emoji if needed
+        let emoji_name = if let Some(avatar_url) = msg.author.avatar_url() {
+            match ensure_user_emoji(&self.state, msg.author.id.get(), &avatar_url).await {
+                Ok(name) => name,
+                Err(e) => {
+                    tracing::warn!("Failed to upload user emoji: {}", e);
+                    String::new()
+                }
+            }
+        } else {
+            String::new()
+        };
+
         if let Err(e) = send_to_discourse(
             &self.state,
             discourse_channel_id,
             &msg.author.name,
+            &emoji_name,
             &content,
         )
         .await
@@ -717,6 +860,7 @@ async fn main() {
         discord_webhooks: Arc::new(RwLock::new(HashMap::new())),
         discourse_webhooks: Arc::new(RwLock::new(HashMap::new())),
         message_map: Arc::new(RwLock::new(HashMap::new())),
+        user_emojis: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let handler = DiscordHandler {
