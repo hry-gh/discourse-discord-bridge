@@ -364,6 +364,8 @@ async fn get_or_create_discourse_webhook(
         emoji: &'a str,
     }
 
+    let emoji_formatted = format!(":{}:", emoji_name);
+
     state
         .http_client
         .put(&update_url)
@@ -374,7 +376,7 @@ async fn get_or_create_discourse_webhook(
             username,
             chat_channel_id: discourse_channel_id,
             description: "",
-            emoji: emoji_name,
+            emoji: &emoji_formatted,
         })
         .send()
         .await?
