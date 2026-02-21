@@ -114,7 +114,7 @@ struct DiscourseUpload {
 
 #[derive(Debug, Deserialize)]
 struct DiscourseReplyInfo {
-    excerpt: String,
+    cooked: String,
     user: DiscourseReplyUser,
     chat_webhook_event: Option<DiscourseWebhookEvent>,
 }
@@ -206,6 +206,19 @@ fn strip_reply_prefix(content: &str) -> String {
     REPLY_PREFIX_RE.replace(content, "").to_string()
 }
 
+fn extract_reply_content(cooked: &str) -> String {
+    // Strip <blockquote>...</blockquote> only at the beginning of cooked HTML
+    static BLOCKQUOTE_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?s)^<blockquote>.*?</blockquote>\n?").unwrap());
+    let without_blockquote = BLOCKQUOTE_RE.replace(cooked, "");
+
+    // Strip HTML tags and convert to plain text
+    static HTML_TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"<[^>]+>").unwrap());
+    let plain = HTML_TAG_RE.replace_all(&without_blockquote, "");
+
+    decode_html_entities(plain.trim())
+}
+
 fn resolve_discord_mentions(content: &str, msg: &DiscordMessage) -> String {
     let mut result = content.to_string();
     for user in &msg.mentions {
@@ -280,9 +293,8 @@ async fn send_to_discord(
             .as_ref()
             .map(|e| e.username.as_str())
             .unwrap_or(&reply.user.username);
-        let excerpt = decode_html_entities(&reply.excerpt);
-        let excerpt = strip_reply_prefix(&excerpt);
-        format!("> **{}:** {}\n{}", username, excerpt, message)
+        let reply_content = extract_reply_content(&reply.cooked);
+        format!("> **{}:** {}\n{}", username, reply_content, message)
     } else {
         message.to_string()
     };
