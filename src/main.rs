@@ -200,6 +200,7 @@ fn decode_html_entities(s: &str) -> String {
 }
 
 fn strip_reply_prefix(content: &str) -> String {
+    // Discord format: > **username:** content\n\n
     static REPLY_PREFIX_RE: Lazy<Regex> =
         Lazy::new(|| Regex::new(r"^> \*\*.*:\*\* .*\n\n").unwrap());
     REPLY_PREFIX_RE.replace(content, "").to_string()
@@ -280,6 +281,7 @@ async fn send_to_discord(
             .map(|e| e.username.as_str())
             .unwrap_or(&reply.user.username);
         let excerpt = decode_html_entities(&reply.excerpt);
+        let excerpt = strip_reply_prefix(&excerpt);
         format!("> **{}:** {}\n{}", username, excerpt, message)
     } else {
         message.to_string()
@@ -337,7 +339,6 @@ async fn get_or_create_discourse_webhook(
         }
     }
 
-    // Try to find existing webhook
     let list_url = format!(
         "{}/admin/plugins/chat/hooks.json",
         state.config.discourse_base_url
@@ -839,7 +840,6 @@ impl EventHandler for DiscordHandler {
             msg.content.clone()
         };
 
-        // Append attachment URLs
         for attachment in &msg.attachments {
             if !content.is_empty() {
                 content.push('\n');
@@ -847,15 +847,12 @@ impl EventHandler for DiscordHandler {
             content.push_str(&attachment.url);
         }
 
-        // Resolve Discord mentions to usernames
         let content = resolve_discord_mentions(&content, &msg);
 
-        // Skip empty messages
         if content.is_empty() {
             return;
         }
 
-        // Upload user's avatar as emoji if needed
         let emoji_name = if let Some(avatar_url) = msg.author.avatar_url() {
             match ensure_user_emoji(&self.state, msg.author.id.get(), &avatar_url).await {
                 Ok(name) => name,
