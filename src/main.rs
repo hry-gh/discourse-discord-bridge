@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use once_cell::sync::Lazy;
+use regex::Regex;
+
 use axum::{
     Router,
     body::Bytes,
@@ -194,6 +197,12 @@ fn decode_html_entities(s: &str) -> String {
         .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
+}
+
+fn strip_reply_prefix(content: &str) -> String {
+    static REPLY_PREFIX_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"^> \*\*.*:\*\* .*\n\n").unwrap());
+    REPLY_PREFIX_RE.replace(content, "").to_string()
 }
 
 fn resolve_discord_mentions(content: &str, msg: &DiscordMessage) -> String {
@@ -821,9 +830,10 @@ impl EventHandler for DiscordHandler {
         );
 
         let mut content = if let Some(ref reply) = msg.referenced_message {
+            let reply_content = strip_reply_prefix(&reply.content);
             format!(
                 "> **{}:** {}\n\n{}",
-                reply.author.name, reply.content, msg.content
+                reply.author.name, reply_content, msg.content
             )
         } else {
             msg.content.clone()
