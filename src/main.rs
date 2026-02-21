@@ -26,6 +26,7 @@ type HmacSha256 = Hmac<Sha256>;
 #[derive(Debug, Deserialize)]
 struct Config {
     discord_bot_token: String,
+    discord_guild_id: u64,
     discourse_webhook_secret: String,
     discourse_base_url: String,
     discourse_mirror_url: String,
@@ -124,7 +125,9 @@ struct DiscourseReplyInfo {
 
 #[derive(Debug, Deserialize)]
 struct DiscourseReplyUser {
+    id: i64,
     username: String,
+    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -340,18 +343,26 @@ async fn send_to_discord(
         .ok_or("Failed to get or create Discord webhook")?;
 
     let mut content = if let Some(reply) = reply_to {
-        let username = reply
+        // Use chat_webhook_event username first, then name for bridged users (id < 0), then username
+        let display_name = reply
             .chat_webhook_event
             .as_ref()
             .map(|e| e.username.as_str())
+            .or_else(|| {
+                if reply.user.id < 0 {
+                    reply.user.name.as_deref()
+                } else {
+                    None
+                }
+            })
             .unwrap_or(&reply.user.username);
         let reply_content = strip_discord_reply_prefix(&extract_reply_content(&reply.cooked));
 
         let db = state.db.lock().await;
         let reply_link = get_discord_message_id(&db, reply.id).map(|discord_msg_id| {
             format!(
-                "https://discord.com/channels/{}/{}",
-                discord_channel_id, discord_msg_id
+                "https://discord.com/channels/{}/{}/{}",
+                state.config.discord_guild_id, discord_channel_id, discord_msg_id
             )
         });
         drop(db);
@@ -359,10 +370,10 @@ async fn send_to_discord(
         if let Some(link) = reply_link {
             format!(
                 "> **[{}]({}):** {}\n{}",
-                username, link, reply_content, message
+                display_name, link, reply_content, message
             )
         } else {
-            format!("> **{}:** {}\n{}", username, reply_content, message)
+            format!("> **{}:** {}\n{}", display_name, reply_content, message)
         }
     } else {
         message.to_string()
