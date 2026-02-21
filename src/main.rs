@@ -188,8 +188,8 @@ fn resolve_discord_mentions(content: &str, msg: &DiscordMessage) -> String {
     for user in &msg.mentions {
         let mention_pattern = format!("<@{}>", user.id);
         let mention_pattern_nick = format!("<@!{}>", user.id);
-        // Use zero-width space after @ to prevent pinging on Discourse
-        let replacement = format!("@\u{200B}{}", user.name);
+        // Use full-width @ to prevent pinging on Discourse
+        let replacement = format!("＠{}", user.name);
         result = result.replace(&mention_pattern, &replacement);
         result = result.replace(&mention_pattern_nick, &replacement);
     }
@@ -232,10 +232,10 @@ async fn get_or_create_discord_webhook(
 
 fn sanitize_discord_message(message: &str) -> String {
     message
-        .replace("@everyone", "@\u{200B}everyone")
-        .replace("@here", "@\u{200B}here")
+        .replace("@everyone", "＠everyone")
+        .replace("@here", "＠here")
         // Role mentions: <@&ROLE_ID>
-        .replace("<@&", "<@\u{200B}&")
+        .replace("<@&", "<＠&")
 }
 
 async fn send_to_discord(
