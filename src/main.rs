@@ -113,10 +113,16 @@ struct DiscourseUpload {
 struct DiscourseReplyInfo {
     excerpt: String,
     user: DiscourseReplyUser,
+    chat_webhook_event: Option<DiscourseWebhookEvent>,
 }
 
 #[derive(Debug, Deserialize)]
 struct DiscourseReplyUser {
+    username: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscourseWebhookEvent {
     username: String,
 }
 
@@ -182,6 +188,27 @@ fn build_avatar_url(base_url: &str, avatar_template: &str) -> String {
     format!("{}{}", base_url, path)
 }
 
+fn decode_html_entities(s: &str) -> String {
+    s.replace("&#39;", "'")
+        .replace("&quot;", "\"")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
+fn resolve_discord_mentions(content: &str, msg: &DiscordMessage) -> String {
+    let mut result = content.to_string();
+    for user in &msg.mentions {
+        let mention_pattern = format!("<@{}>", user.id);
+        let mention_pattern_nick = format!("<@!{}>", user.id);
+        // Use zero-width space after @ to prevent pinging on Discourse
+        let replacement = format!("@\u{200B}{}", user.name);
+        result = result.replace(&mention_pattern, &replacement);
+        result = result.replace(&mention_pattern_nick, &replacement);
+    }
+    result
+}
+
 async fn get_or_create_discord_webhook(
     state: &AppState,
     discord_channel_id: u64,
@@ -238,10 +265,13 @@ async fn send_to_discord(
         .ok_or("Failed to get or create Discord webhook")?;
 
     let mut content = if let Some(reply) = reply_to {
-        format!(
-            "> **@{}:** {}\n{}",
-            reply.user.username, reply.excerpt, message
-        )
+        let username = reply
+            .chat_webhook_event
+            .as_ref()
+            .map(|e| e.username.as_str())
+            .unwrap_or(&reply.user.username);
+        let excerpt = decode_html_entities(&reply.excerpt);
+        format!("> **{}:** {}\n{}", username, excerpt, message)
     } else {
         message.to_string()
     };
@@ -502,7 +532,7 @@ async fn ensure_user_emoji(
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
 
-        if body.contains("already been taken") || body.contains("already exists") {
+        if body.contains("already in use") || body.contains("already exists") {
             tracing::debug!("Emoji {} already exists", emoji_name);
             false
         } else {
@@ -792,7 +822,7 @@ impl EventHandler for DiscordHandler {
 
         let mut content = if let Some(ref reply) = msg.referenced_message {
             format!(
-                "> **@{}:** {}\n\n{}",
+                "> **{}:** {}\n\n{}",
                 reply.author.name, reply.content, msg.content
             )
         } else {
@@ -806,6 +836,9 @@ impl EventHandler for DiscordHandler {
             }
             content.push_str(&attachment.url);
         }
+
+        // Resolve Discord mentions to usernames
+        let content = resolve_discord_mentions(&content, &msg);
 
         // Skip empty messages
         if content.is_empty() {
