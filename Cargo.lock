@@ -360,7 +360,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serenity",
- "sha1",
  "sha2",
  "tokio",
  "toml",

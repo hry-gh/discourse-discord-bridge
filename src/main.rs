@@ -17,7 +17,6 @@ use serenity::all::{
     ChannelId, Client, Context, CreateWebhook, EditWebhookMessage, EventHandler, ExecuteWebhook,
     GatewayIntents, Http, Message as DiscordMessage, MessageId, Ready, Webhook,
 };
-use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use tokio::sync::RwLock;
 
@@ -28,8 +27,7 @@ struct Config {
     discord_bot_token: String,
     discourse_webhook_secret: String,
     discourse_base_url: String,
-    discourse_api_username: String,
-    discourse_api_key: String,
+    discourse_mirror_url: String,
     listen_address: Option<String>,
     #[serde(default)]
     channel_mappings: HashMap<String, u64>,
@@ -63,8 +61,6 @@ impl Config {
     }
 }
 
-type DiscourseWebhookKey = (String, u64);
-
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
@@ -76,12 +72,8 @@ struct AppState {
     reverse_mappings: Arc<HashMap<u64, u64>>,
     // Discord channel -> Discord webhook
     discord_webhooks: Arc<RwLock<HashMap<u64, Webhook>>>,
-    // (username, discourse_channel_id) -> Discourse webhook URL
-    discourse_webhooks: Arc<RwLock<HashMap<DiscourseWebhookKey, String>>>,
     // Discourse message ID -> Discord message ID
     message_map: Arc<RwLock<HashMap<u64, u64>>>,
-    // Discord user ID -> Discourse emoji name (already uploaded)
-    user_emojis: Arc<RwLock<HashMap<u64, String>>>,
 }
 
 // Discourse -> Discord types
@@ -139,34 +131,6 @@ struct DiscourseUser {
 struct DiscourseChannel {
     id: u64,
     title: String,
-}
-
-// Discourse webhook creation response
-#[derive(Debug, Deserialize)]
-struct DiscourseWebhookResponse {
-    id: u64,
-    url: String,
-}
-
-// Discourse list webhooks response
-#[derive(Debug, Deserialize)]
-struct DiscourseWebhooksListResponse {
-    incoming_chat_webhooks: Vec<DiscourseIncomingWebhook>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DiscourseIncomingWebhook {
-    #[allow(dead_code)]
-    id: u64,
-    name: String,
-    url: String,
-    username: Option<String>,
-    chat_channel: DiscourseWebhookChannel,
-}
-
-#[derive(Debug, Deserialize)]
-struct DiscourseWebhookChannel {
-    id: u64,
 }
 
 fn verify_signature(secret: &str, body: &[u8], signature_header: &str) -> bool {
@@ -335,129 +299,52 @@ async fn send_to_discord(
     Ok(())
 }
 
-async fn get_or_create_discourse_webhook(
-    state: &AppState,
-    username: &str,
-    emoji_name: &str,
-    discourse_channel_id: u64,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let webhook_name = format!("{}-{}-{}", username, emoji_name, discourse_channel_id);
-    let key = (webhook_name.clone(), discourse_channel_id);
-
-    {
-        let webhooks = state.discourse_webhooks.read().await;
-        if let Some(url) = webhooks.get(&key) {
-            return Ok(url.clone());
-        }
-    }
-
-    let list_url = format!(
-        "{}/admin/plugins/chat/hooks.json",
-        state.config.discourse_base_url
-    );
-    let response: DiscourseWebhooksListResponse = state
-        .http_client
-        .get(&list_url)
-        .header("Api-Username", &state.config.discourse_api_username)
-        .header("Api-Key", &state.config.discourse_api_key)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-
-    for webhook in response.incoming_chat_webhooks {
-        if webhook.name == webhook_name && webhook.chat_channel.id == discourse_channel_id {
-            let mut webhooks = state.discourse_webhooks.write().await;
-            webhooks.insert(key, webhook.url.clone());
-            return Ok(webhook.url);
-        }
-    }
-
-    let create_url = format!(
-        "{}/admin/plugins/chat/hooks",
-        state.config.discourse_base_url
-    );
-
-    #[derive(Serialize)]
-    struct CreateWebhookForm<'a> {
-        name: &'a str,
-        username: &'a str,
-        chat_channel_id: u64,
-    }
-
-    let response: DiscourseWebhookResponse = state
-        .http_client
-        .post(&create_url)
-        .header("Api-Username", &state.config.discourse_api_username)
-        .header("Api-Key", &state.config.discourse_api_key)
-        .form(&CreateWebhookForm {
-            name: &webhook_name,
-            username,
-            chat_channel_id: discourse_channel_id,
-        })
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-
-    let update_url = format!(
-        "{}/admin/plugins/chat/hooks/{}",
-        state.config.discourse_base_url, response.id
-    );
-
-    #[derive(Serialize)]
-    struct UpdateWebhookForm<'a> {
-        name: &'a str,
-        username: &'a str,
-        chat_channel_id: u64,
-        description: &'a str,
-        emoji: &'a str,
-    }
-
-    let emoji_formatted = format!(":{}:", emoji_name);
-
-    state
-        .http_client
-        .put(&update_url)
-        .header("Api-Username", &state.config.discourse_api_username)
-        .header("Api-Key", &state.config.discourse_api_key)
-        .form(&UpdateWebhookForm {
-            name: &webhook_name,
-            username,
-            chat_channel_id: discourse_channel_id,
-            description: "",
-            emoji: &emoji_formatted,
-        })
-        .send()
-        .await?
-        .error_for_status()?;
-
-    let mut webhooks = state.discourse_webhooks.write().await;
-    webhooks.insert(key, response.url.clone());
-    Ok(response.url)
-}
-
 async fn send_to_discourse(
     state: &AppState,
     discourse_channel_id: u64,
-    username: &str,
-    emoji_name: &str,
+    discord_user_id: u64,
+    discord_username: &str,
+    discord_avatar_url: Option<String>,
     message: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let webhook_url =
-        get_or_create_discourse_webhook(state, username, emoji_name, discourse_channel_id).await?;
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    #[derive(Serialize)]
+    struct DiscordUser<'a> {
+        id: String,
+        username: &'a str,
+        avatar_url: Option<String>,
+    }
 
     #[derive(Serialize)]
-    struct DiscourseMessageForm<'a> {
-        text: &'a str,
+    struct MessagePayload<'a> {
+        content: &'a str,
     }
+
+    #[derive(Serialize)]
+    struct MirrorPayload<'a> {
+        channel_id: u64,
+        discord_user: DiscordUser<'a>,
+        message: MessagePayload<'a>,
+    }
+
+    #[derive(Deserialize)]
+    struct MirrorResponse {
+        discourse_message_id: u64,
+    }
+
+    let payload = MirrorPayload {
+        channel_id: discourse_channel_id,
+        discord_user: DiscordUser {
+            id: discord_user_id.to_string(),
+            username: discord_username,
+            avatar_url: discord_avatar_url,
+        },
+        message: MessagePayload { content: message },
+    };
 
     let response = state
         .http_client
-        .post(&webhook_url)
-        .form(&DiscourseMessageForm { text: message })
+        .post(&state.config.discourse_mirror_url)
+        .json(&payload)
         .send()
         .await?;
 
@@ -465,145 +352,17 @@ async fn send_to_discourse(
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         tracing::error!(
-            "Discourse webhook failed: status={}, url={}, username={}, message={:?}, response={}",
+            "Discourse mirror failed: status={}, username={}, message={:?}, response={}",
             status,
-            webhook_url,
-            username,
+            discord_username,
             message,
             body
         );
-        return Err(format!("Discourse webhook failed: {} - {}", status, body).into());
+        return Err(format!("Discourse mirror failed: {} - {}", status, body).into());
     }
 
-    Ok(())
-}
-
-async fn ensure_user_emoji(
-    state: &AppState,
-    user_id: u64,
-    avatar_url: &str,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    {
-        let emojis = state.user_emojis.read().await;
-        if let Some(emoji_name) = emojis.get(&user_id) {
-            return Ok(emoji_name.clone());
-        }
-    }
-
-    let emoji_name = avatar_url
-        .split('/')
-        .next_back()
-        .and_then(|s| s.split('?').next())
-        .and_then(|s| {
-            s.strip_suffix(".webp")
-                .or_else(|| s.strip_suffix(".png"))
-                .or_else(|| s.strip_suffix(".gif"))
-        })
-        .unwrap_or("avatar")
-        .to_string();
-
-    let avatar_bytes = state
-        .http_client
-        .get(avatar_url)
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
-
-    let mut hasher = Sha1::new();
-    hasher.update(&avatar_bytes);
-    let sha1_checksum = hex::encode(hasher.finalize());
-
-    let content_type = if avatar_url.contains(".webp") {
-        "image/webp"
-    } else if avatar_url.contains(".gif") {
-        "image/gif"
-    } else {
-        "image/png"
-    };
-
-    let upload_url = format!(
-        "{}/admin/config/emoji.json",
-        state.config.discourse_base_url
-    );
-
-    let form = reqwest::multipart::Form::new()
-        .text("upload_type", "emoji")
-        .text("name", emoji_name.clone())
-        .text("type", content_type.to_string())
-        .text("group", "user")
-        .text("sha1_checksum", sha1_checksum)
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(avatar_bytes.to_vec())
-                .file_name(format!("{}.webp", emoji_name))
-                .mime_str(content_type)?,
-        );
-
-    let response = state
-        .http_client
-        .post(&upload_url)
-        .header("Api-Username", &state.config.discourse_api_username)
-        .header("Api-Key", &state.config.discourse_api_key)
-        .multipart(form)
-        .send()
-        .await?;
-
-    let emoji_created = if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-
-        if body.contains("already in use") || body.contains("already exists") {
-            tracing::debug!("Emoji {} already exists", emoji_name);
-            false
-        } else {
-            tracing::warn!(
-                "Failed to upload emoji {}: {} - {}",
-                emoji_name,
-                status,
-                body
-            );
-            false
-        }
-    } else {
-        tracing::info!("Uploaded emoji {} for user {}", emoji_name, user_id);
-        true
-    };
-
-    if emoji_created {
-        let deny_list_url = format!(
-            "{}/admin/site_settings/emoji_deny_list",
-            state.config.discourse_base_url
-        );
-
-        let response = state
-            .http_client
-            .put(&deny_list_url)
-            .header("Api-Username", &state.config.discourse_api_username)
-            .header("Api-Key", &state.config.discourse_api_key)
-            .form(&[("emoji_deny_list", &emoji_name)])
-            .send()
-            .await;
-
-        match response {
-            Ok(r) if r.status().is_success() => {
-                tracing::debug!("Added emoji {} to deny list", emoji_name);
-            }
-            Ok(r) => {
-                let body = r.text().await.unwrap_or_default();
-                tracing::warn!("Failed to add emoji {} to deny list: {}", emoji_name, body);
-            }
-            Err(e) => {
-                tracing::warn!("Failed to add emoji {} to deny list: {}", emoji_name, e);
-            }
-        }
-    }
-
-    let mut emojis = state.user_emojis.write().await;
-    emojis.insert(user_id, emoji_name.clone());
-
-    Ok(emoji_name)
+    let result: MirrorResponse = response.json().await?;
+    Ok(result.discourse_message_id)
 }
 
 async fn handle_discourse_webhook(
@@ -865,28 +624,22 @@ impl EventHandler for DiscordHandler {
             return;
         }
 
-        let emoji_name = if let Some(avatar_url) = msg.author.avatar_url() {
-            match ensure_user_emoji(&self.state, msg.author.id.get(), &avatar_url).await {
-                Ok(name) => name,
-                Err(e) => {
-                    tracing::warn!("Failed to upload user emoji: {}", e);
-                    String::new()
-                }
-            }
-        } else {
-            String::new()
-        };
-
-        if let Err(e) = send_to_discourse(
+        match send_to_discourse(
             &self.state,
             discourse_channel_id,
+            msg.author.id.get(),
             &msg.author.name,
-            &emoji_name,
+            msg.author.avatar_url(),
             &content,
         )
         .await
         {
-            tracing::error!("Failed to send to Discourse: {}", e);
+            Ok(discourse_message_id) => {
+                tracing::debug!("Sent to Discourse: message_id={}", discourse_message_id);
+            }
+            Err(e) => {
+                tracing::error!("Failed to send to Discourse: {}", e);
+            }
         }
     }
 }
@@ -912,9 +665,7 @@ async fn main() {
         channel_mappings: Arc::new(channel_mappings),
         reverse_mappings: Arc::new(reverse_mappings),
         discord_webhooks: Arc::new(RwLock::new(HashMap::new())),
-        discourse_webhooks: Arc::new(RwLock::new(HashMap::new())),
         message_map: Arc::new(RwLock::new(HashMap::new())),
-        user_emojis: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let handler = DiscordHandler {
