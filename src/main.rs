@@ -93,7 +93,6 @@ struct DiscourseMessage {
     id: u64,
     message: String,
     user: DiscourseUser,
-    chat_webhook_event: Option<serde_json::Value>,
     in_reply_to: Option<DiscourseReplyInfo>,
     #[serde(default)]
     uploads: Vec<DiscourseUpload>,
@@ -123,6 +122,7 @@ struct DiscourseWebhookEvent {
 
 #[derive(Debug, Deserialize)]
 struct DiscourseUser {
+    id: i64,
     username: String,
     avatar_template: String,
 }
@@ -399,11 +399,7 @@ async fn handle_discourse_webhook(
     let msg = &payload.chat_message.message;
     let channel = &payload.chat_message.channel;
 
-    if msg.chat_webhook_event.is_some() {
-        return StatusCode::OK;
-    }
-
-    if msg.user.username == "system" {
+    if msg.user.id < 0 {
         return StatusCode::OK;
     }
 
