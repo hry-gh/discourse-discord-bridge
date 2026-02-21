@@ -183,6 +183,14 @@ fn store_message_link(
 }
 
 fn get_discord_message_id(conn: &Connection, discourse_id: u64) -> Option<u64> {
+    if let Ok(id) = conn.query_row(
+        "SELECT source_id FROM message_links WHERE source = 'discord' AND target_id = ?1",
+        rusqlite::params![discourse_id as i64],
+        |row| row.get::<_, i64>(0),
+    ) {
+        return Some(id as u64);
+    }
+
     conn.query_row(
         "SELECT target_id FROM message_links WHERE source = 'discourse' AND source_id = ?1",
         rusqlite::params![discourse_id as i64],
@@ -193,8 +201,16 @@ fn get_discord_message_id(conn: &Connection, discourse_id: u64) -> Option<u64> {
 }
 
 fn get_discourse_message_id(conn: &Connection, discord_id: u64) -> Option<u64> {
-    conn.query_row(
+    if let Ok(id) = conn.query_row(
         "SELECT target_id FROM message_links WHERE source = 'discord' AND source_id = ?1",
+        rusqlite::params![discord_id as i64],
+        |row| row.get::<_, i64>(0),
+    ) {
+        return Some(id as u64);
+    }
+
+    conn.query_row(
+        "SELECT source_id FROM message_links WHERE source = 'discourse' AND target_id = ?1",
         rusqlite::params![discord_id as i64],
         |row| row.get::<_, i64>(0),
     )
@@ -246,14 +262,13 @@ fn extract_reply_content(cooked: &str) -> String {
 }
 
 fn strip_discord_reply_prefix(content: &str) -> String {
-    static REPLY_PREFIX_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"^↩️ \[[^\]]+\]\([^)]+\): [^\n]*\n").unwrap());
-
+    // Matches both formats:
+    // > **[username](link):** content\n (with link)
+    // > **username:** content\n (without link)
     static BLOCKQUOTE_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"^> \*\*[^*]+:\*\* [^\n]*\n").unwrap());
+        Lazy::new(|| Regex::new(r"^> \*\*(\[[^\]]+\]\([^)]+\)|[^*]+):\*\* [^\n]*\n").unwrap());
 
-    let content = REPLY_PREFIX_RE.replace(content, "");
-    BLOCKQUOTE_RE.replace(&content, "").to_string()
+    BLOCKQUOTE_RE.replace(content, "").to_string()
 }
 
 fn resolve_discord_mentions(content: &str, msg: &DiscordMessage) -> String {
@@ -343,7 +358,7 @@ async fn send_to_discord(
 
         if let Some(link) = reply_link {
             format!(
-                "↩️ [{}]({}): {}\n{}",
+                "> **[{}]({}):** {}\n{}",
                 username, link, reply_content, message
             )
         } else {
