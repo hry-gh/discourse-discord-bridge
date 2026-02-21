@@ -6,3 +6,4 @@ services:
       - "3000:3000"
     volumes:
       - ./config.toml:/config/config.toml:ro
+      - ./data:/data

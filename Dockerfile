@@ -18,4 +18,7 @@ RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/
 
 COPY --from=builder /app/target/release/discourse-discord-bridge /usr/local/bin/
 
+RUN mkdir -p /data
+WORKDIR /data
+
 ENTRYPOINT ["discourse-discord-bridge", "/config/config.toml"]

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use once_cell::sync::Lazy;
 use regex::Regex;
+use rusqlite::Connection;
 
 use axum::{
     Router,
@@ -18,7 +19,7 @@ use serenity::all::{
     GatewayIntents, Http, Message as DiscordMessage, MessageId, Ready, Webhook,
 };
 use sha2::Sha256;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -29,8 +30,18 @@ struct Config {
     discourse_base_url: String,
     discourse_mirror_url: String,
     listen_address: Option<String>,
+    #[serde(default = "default_database_path")]
+    database_path: String,
     #[serde(default)]
     channel_mappings: HashMap<String, u64>,
+}
+
+fn default_database_path() -> String {
+    if std::path::Path::new("/data").exists() {
+        "/data/messages.db".to_string()
+    } else {
+        "messages.db".to_string()
+    }
 }
 
 impl Config {
@@ -72,8 +83,8 @@ struct AppState {
     reverse_mappings: Arc<HashMap<u64, u64>>,
     // Discord channel -> Discord webhook
     discord_webhooks: Arc<RwLock<HashMap<u64, Webhook>>>,
-    // Discourse message ID -> Discord message ID
-    message_map: Arc<RwLock<HashMap<u64, u64>>>,
+    // SQLite database for message ID mappings
+    db: Arc<Mutex<Connection>>,
 }
 
 // Discourse -> Discord types
@@ -105,6 +116,7 @@ struct DiscourseUpload {
 
 #[derive(Debug, Deserialize)]
 struct DiscourseReplyInfo {
+    id: u64,
     cooked: String,
     user: DiscourseReplyUser,
     chat_webhook_event: Option<DiscourseWebhookEvent>,
@@ -131,6 +143,63 @@ struct DiscourseUser {
 struct DiscourseChannel {
     id: u64,
     title: String,
+}
+
+fn init_database(path: &str) -> rusqlite::Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS message_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            source_id INTEGER NOT NULL,
+            target_id INTEGER NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            UNIQUE(source, source_id)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_source ON message_links(source, source_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_target ON message_links(source, target_id)",
+        [],
+    )?;
+    Ok(conn)
+}
+
+fn store_message_link(
+    conn: &Connection,
+    source: &str,
+    source_id: u64,
+    target_id: u64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO message_links (source, source_id, target_id) VALUES (?1, ?2, ?3)",
+        rusqlite::params![source, source_id as i64, target_id as i64],
+    )?;
+    Ok(())
+}
+
+fn get_discord_message_id(conn: &Connection, discourse_id: u64) -> Option<u64> {
+    conn.query_row(
+        "SELECT target_id FROM message_links WHERE source = 'discourse' AND source_id = ?1",
+        rusqlite::params![discourse_id as i64],
+        |row| row.get::<_, i64>(0),
+    )
+    .ok()
+    .map(|id| id as u64)
+}
+
+fn get_discourse_message_id(conn: &Connection, discord_id: u64) -> Option<u64> {
+    conn.query_row(
+        "SELECT target_id FROM message_links WHERE source = 'discord' AND source_id = ?1",
+        rusqlite::params![discord_id as i64],
+        |row| row.get::<_, i64>(0),
+    )
+    .ok()
+    .map(|id| id as u64)
 }
 
 fn verify_signature(secret: &str, body: &[u8], signature_header: &str) -> bool {
@@ -163,13 +232,6 @@ fn decode_html_entities(s: &str) -> String {
         .replace("&gt;", ">")
 }
 
-fn strip_reply_prefix(content: &str) -> String {
-    // Discord format: > **username:** content\n\n
-    static REPLY_PREFIX_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"^> \*\*.*:\*\* .*\n\n").unwrap());
-    REPLY_PREFIX_RE.replace(content, "").to_string()
-}
-
 fn extract_reply_content(cooked: &str) -> String {
     // Strip <blockquote>...</blockquote> only at the beginning of cooked HTML
     static BLOCKQUOTE_RE: Lazy<Regex> =
@@ -181,6 +243,17 @@ fn extract_reply_content(cooked: &str) -> String {
     let plain = HTML_TAG_RE.replace_all(&without_blockquote, "");
 
     decode_html_entities(plain.trim())
+}
+
+fn strip_discord_reply_prefix(content: &str) -> String {
+    static REPLY_PREFIX_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"^↩️ \[[^\]]+\]\([^)]+\): [^\n]*\n").unwrap());
+
+    static BLOCKQUOTE_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"^> \*\*[^*]+:\*\* [^\n]*\n").unwrap());
+
+    let content = REPLY_PREFIX_RE.replace(content, "");
+    BLOCKQUOTE_RE.replace(&content, "").to_string()
 }
 
 fn resolve_discord_mentions(content: &str, msg: &DiscordMessage) -> String {
@@ -257,8 +330,25 @@ async fn send_to_discord(
             .as_ref()
             .map(|e| e.username.as_str())
             .unwrap_or(&reply.user.username);
-        let reply_content = extract_reply_content(&reply.cooked);
-        format!("> **{}:** {}\n{}", username, reply_content, message)
+        let reply_content = strip_discord_reply_prefix(&extract_reply_content(&reply.cooked));
+
+        let db = state.db.lock().await;
+        let reply_link = get_discord_message_id(&db, reply.id).map(|discord_msg_id| {
+            format!(
+                "https://discord.com/channels/{}/{}",
+                discord_channel_id, discord_msg_id
+            )
+        });
+        drop(db);
+
+        if let Some(link) = reply_link {
+            format!(
+                "↩️ [{}]({}): {}\n{}",
+                username, link, reply_content, message
+            )
+        } else {
+            format!("> **{}:** {}\n{}", username, reply_content, message)
+        }
     } else {
         message.to_string()
     };
@@ -287,8 +377,15 @@ async fn send_to_discord(
         ));
 
     if let Some(discord_message) = webhook.execute(&state.discord_http, true, builder).await? {
-        let mut message_map = state.message_map.write().await;
-        message_map.insert(discourse_message_id, discord_message.id.get());
+        let db = state.db.lock().await;
+        if let Err(e) = store_message_link(
+            &db,
+            "discourse",
+            discourse_message_id,
+            discord_message.id.get(),
+        ) {
+            tracing::warn!("Failed to store message link: {}", e);
+        }
         tracing::debug!(
             "Mapped Discourse message {} -> Discord message {}",
             discourse_message_id,
@@ -302,10 +399,12 @@ async fn send_to_discord(
 async fn send_to_discourse(
     state: &AppState,
     discourse_channel_id: u64,
+    discord_message_id: u64,
     discord_user_id: u64,
     discord_username: &str,
     discord_avatar_url: Option<String>,
     message: &str,
+    reply_to_message_id: Option<u64>,
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
     #[derive(Serialize)]
     struct DiscordUser<'a> {
@@ -324,6 +423,8 @@ async fn send_to_discourse(
         channel_id: u64,
         discord_user: DiscordUser<'a>,
         message: MessagePayload<'a>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reply_to_message_id: Option<u64>,
     }
 
     #[derive(Deserialize)]
@@ -339,6 +440,7 @@ async fn send_to_discourse(
             avatar_url: discord_avatar_url,
         },
         message: MessagePayload { content: message },
+        reply_to_message_id,
     };
 
     let response = state
@@ -362,6 +464,22 @@ async fn send_to_discourse(
     }
 
     let result: MirrorResponse = response.json().await?;
+
+    let db = state.db.lock().await;
+    if let Err(e) = store_message_link(
+        &db,
+        "discord",
+        discord_message_id,
+        result.discourse_message_id,
+    ) {
+        tracing::warn!("Failed to store message link: {}", e);
+    }
+    tracing::debug!(
+        "Mapped Discord message {} -> Discourse message {}",
+        discord_message_id,
+        result.discourse_message_id
+    );
+
     Ok(result.discourse_message_id)
 }
 
@@ -488,9 +606,9 @@ async fn edit_discord_message(
     uploads: &[DiscourseUpload],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let discord_message_id = {
-        let message_map = state.message_map.read().await;
-        match message_map.get(&discourse_message_id) {
-            Some(&id) => id,
+        let db = state.db.lock().await;
+        match get_discord_message_id(&db, discourse_message_id) {
+            Some(id) => id,
             None => {
                 tracing::debug!(
                     "No Discord message ID found for Discourse message {}",
@@ -540,8 +658,8 @@ async fn delete_discord_message(
     discourse_message_id: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let discord_message_id = {
-        let mut message_map = state.message_map.write().await;
-        match message_map.remove(&discourse_message_id) {
+        let db = state.db.lock().await;
+        match get_discord_message_id(&db, discourse_message_id) {
             Some(id) => id,
             None => {
                 tracing::debug!(
@@ -597,15 +715,14 @@ impl EventHandler for DiscordHandler {
             msg.content
         );
 
-        let mut content = if let Some(ref reply) = msg.referenced_message {
-            let reply_content = strip_reply_prefix(&reply.content);
-            format!(
-                "> **{}:** {}\n\n{}",
-                reply.author.name, reply_content, msg.content
-            )
+        let reply_to_discourse_id = if let Some(ref reply) = msg.referenced_message {
+            let db = self.state.db.lock().await;
+            get_discourse_message_id(&db, reply.id.get())
         } else {
-            msg.content.clone()
+            None
         };
+
+        let mut content = msg.content.clone();
 
         for attachment in &msg.attachments {
             if !content.is_empty() {
@@ -623,10 +740,12 @@ impl EventHandler for DiscordHandler {
         match send_to_discourse(
             &self.state,
             discourse_channel_id,
+            msg.id.get(),
             msg.author.id.get(),
             &msg.author.name,
             msg.author.avatar_url(),
             &content,
+            reply_to_discourse_id,
         )
         .await
         {
@@ -654,6 +773,9 @@ async fn main() {
     let reverse_mappings = config.reverse_channel_mappings();
     let discord_http = Arc::new(Http::new(&config.discord_bot_token));
 
+    let db = init_database(&config.database_path).expect("Failed to initialize database");
+    tracing::info!("Using database: {}", config.database_path);
+
     let state = AppState {
         config: Arc::new(config),
         http_client: reqwest::Client::new(),
@@ -661,7 +783,7 @@ async fn main() {
         channel_mappings: Arc::new(channel_mappings),
         reverse_mappings: Arc::new(reverse_mappings),
         discord_webhooks: Arc::new(RwLock::new(HashMap::new())),
-        message_map: Arc::new(RwLock::new(HashMap::new())),
+        db: Arc::new(Mutex::new(db)),
     };
 
     let handler = DiscordHandler {
